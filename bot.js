@@ -2,7 +2,7 @@ const TelegramBot = require("node-telegram-bot-api");
 const fetch = require("node-fetch");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const MAILTM = "https://api.mail.tm";
+const MAILTM = "https://api.mail.gw";
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const sessions = {};
