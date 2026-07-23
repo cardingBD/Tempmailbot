@@ -2,8 +2,6 @@ const TelegramBot = require("node-telegram-bot-api");
 const fetch = require("node-fetch");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const MAILTM = "https://api.mail.gw";
-
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const sessions = {};
 
@@ -45,105 +43,32 @@ function mainKeyboard() {
   };
 }
 
-async function getDomains() {
-  const res = await fetch(`${MAILTM}/domains`, {
-    headers: { "User-Agent": "TempMailBot/1.0" },
-  });
-  if (!res.ok) throw new Error(`Domains failed: ${res.status}`);
+async function createEmail() {
+  const res = await fetch(
+    "https://www.1secmail.com/api/v1/?action=genRandomMailbox&count=1"
+  );
+  if (!res.ok) throw new Error(`Generate failed: ${res.status}`);
   const data = await res.json();
-  return data["hydra:member"] || [];
+  if (!data || !data[0]) throw new Error("No email generated");
+  const email = data[0];
+  const [login, domain] = email.split("@");
+  return { email, login, domain };
 }
 
-async function createAccount() {
-  const domains = await getDomains();
-  if (!domains.length) throw new Error("No domains available");
-
-  for (let i = 0; i < 8; i++) {
-    const domain = domains[Math.floor(Math.random() * domains.length)].domain;
-    const address = `\( {randomString(12)}@ \){domain}`;
-    const password = randomString(16);
-
-    const res = await fetch(`${MAILTM}/accounts`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": "TempMailBot/1.0",
-      },
-      body: JSON.stringify({ address, password }),
-    });
-
-    const text = await res.text();
-    if (!text) continue;
-
-    let account;
-    try {
-      account = JSON.parse(text);
-    } catch {
-      continue;
-    }
-
-    if (account && account.id) {
-      return { address, password, account };
-    }
-
-    if (res.status === 429) {
-      await new Promise((r) => setTimeout(r, 1500));
-    }
-  }
-  throw new Error("Could not create account after retries");
-}
-
-async function getToken(address, password) {
-  const res = await fetch(`${MAILTM}/token`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": "TempMailBot/1.0",
-    },
-    body: JSON.stringify({ address, password }),
-  });
-  if (!res.ok) throw new Error(`Token failed: ${res.status}`);
+async function getMessages(login, domain) {
+  const res = await fetch(
+    `https://www.1secmail.com/api/v1/?action=getMessages&login=\( {login}&domain= \){domain}`
+  );
+  if (!res.ok) throw new Error(`Inbox failed: ${res.status}`);
   return res.json();
 }
 
-async function safeJson(res) {
-  const text = await res.text();
-  if (!text || text.trim() === "") return null;
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
-async function getMessages(token) {
-  const res = await fetch(`${MAILTM}/messages`, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "User-Agent": "TempMailBot/1.0",
-    },
-  });
-  return safeJson(res);
-}
-
-async function getMessage(token, id) {
-  const res = await fetch(`\( {MAILTM}/messages/ \){id}`, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "User-Agent": "TempMailBot/1.0",
-    },
-  });
-  return safeJson(res);
-}
-
-async function deleteAccount(token, accountId) {
-  await fetch(`\( {MAILTM}/accounts/ \){accountId}`, {
-    method: "DELETE",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "User-Agent": "TempMailBot/1.0",
-    },
-  });
+async function readMessage(login, domain, id) {
+  const res = await fetch(
+    `https://www.1secmail.com/api/v1/?action=readMessage&login=\( {login}&domain= \){domain}&id=${id}`
+  );
+  if (!res.ok) throw new Error(`Read failed: ${res.status}`);
+  return res.json();
 }
 
 // /start
@@ -157,7 +82,7 @@ bot.onText(/\/start/, async (msg) => {
   );
 });
 
-// Button handlers
+// Buttons
 bot.on("message", async (msg) => {
   if (!msg.text || msg.text.startsWith("/")) return;
 
@@ -190,30 +115,19 @@ bot.on("message", async (msg) => {
     });
 
     try {
-      const { address, password, account } = await createAccount();
-      const tokenData = await getToken(address, password);
-
-      if (!tokenData.token) {
-        throw new Error("No token received");
-      }
-
-      sessions[chatId] = {
-        email: address,
-        password,
-        token: tokenData.token,
-        accountId: account.id,
-      };
+      const { email, login, domain } = await createEmail();
+      sessions[chatId] = { email, login, domain };
 
       await bot.sendMessage(
         chatId,
-        `✅ *Ready!*\n\n📧 \`${address}\`\n\n👆 Tap to copy`,
+        `✅ *Ready!*\n\n📧 \`${email}\`\n\n👆 Tap to copy`,
         { parse_mode: "Markdown", reply_markup: mainKeyboard() }
       );
     } catch (err) {
       console.error("NEWMAIL ERROR:", err);
       await bot.sendMessage(
         chatId,
-        `❌ ${err.message || "Unknown error"}\n\nTry again in a few seconds.`,
+        `❌ ${err.message}\n\nTry again.`,
         { reply_markup: mainKeyboard() }
       );
     }
@@ -250,18 +164,12 @@ bot.on("message", async (msg) => {
     });
 
     try {
-      const result = await getMessages(sessions[chatId].token);
+      const messages = await getMessages(
+        sessions[chatId].login,
+        sessions[chatId].domain
+      );
 
-      if (!result || !result["hydra:member"]) {
-        await bot.sendMessage(chatId, "⚠️ Could not reach mail server.", {
-          reply_markup: mainKeyboard(),
-        });
-        return;
-      }
-
-      const messages = result["hydra:member"];
-
-      if (!messages.length) {
+      if (!messages || messages.length === 0) {
         await bot.sendMessage(
           chatId,
           `📭 *Empty*\n\n\`${sessions[chatId].email}\``,
@@ -274,7 +182,7 @@ bot.on("message", async (msg) => {
 
       let list = `📬 *${messages.length} email(s)*\n\n`;
       messages.forEach((m, i) => {
-        list += `*\( {i + 1}.* From: \` \){m.from.address}\`\n`;
+        list += `*\( {i + 1}.* From: \` \){m.from}\`\n`;
         list += `    ${escapeMarkdown(m.subject || "No subject")}\n\n`;
       });
       list += `Reply with number (1, 2, 3...) to read.`;
@@ -285,7 +193,7 @@ bot.on("message", async (msg) => {
       });
     } catch (err) {
       console.error(err);
-      await bot.sendMessage(chatId, "❌ Inbox failed.", {
+      await bot.sendMessage(chatId, `❌ ${err.message}`, {
         reply_markup: mainKeyboard(),
       });
     }
@@ -303,33 +211,24 @@ bot.on("message", async (msg) => {
     }
 
     try {
-      const full = await getMessage(
-        sessions[chatId].token,
-        sessions[chatId].messages[index].id
+      const msgData = sessions[chatId].messages[index];
+      const full = await readMessage(
+        sessions[chatId].login,
+        sessions[chatId].domain,
+        msgData.id
       );
 
-      if (!full) {
-        await bot.sendMessage(chatId, "⚠️ Could not fetch email.", {
-          reply_markup: mainKeyboard(),
-        });
-        return;
+      let rawBody = full.textBody || full.htmlBody || "(Empty)";
+      if (full.htmlBody && !full.textBody) {
+        rawBody = stripHtml(full.htmlBody);
       }
-
-      let rawBody = "(Empty)";
-      if (full.text) {
-        rawBody = full.text.substring(0, 4000);
-      } else if (full.html) {
-        const htmlStr = Array.isArray(full.html)
-          ? full.html.map((h) => (typeof h === "string" ? h : h.value || "")).join(" ")
-          : String(full.html);
-        rawBody = stripHtml(htmlStr).substring(0, 4000);
-      }
+      rawBody = rawBody.substring(0, 4000);
 
       const otp = detectOtp(rawBody);
 
       await bot.sendMessage(
         chatId,
-        `📩 *#\( {index + 1}*\nFrom: \` \){full.from.address}\`\nSubject: ${escapeMarkdown(
+        `📩 *#\( {index + 1}*\nFrom: \` \){full.from}\`\nSubject: ${escapeMarkdown(
           full.subject || "—"
         )}` + (otp ? `\n🔐 OTP: \`${otp}\`` : ""),
         { parse_mode: "Markdown" }
@@ -341,7 +240,7 @@ bot.on("message", async (msg) => {
       });
     } catch (err) {
       console.error(err);
-      await bot.sendMessage(chatId, "❌ Read failed.", {
+      await bot.sendMessage(chatId, `❌ ${err.message}`, {
         reply_markup: mainKeyboard(),
       });
     }
@@ -356,9 +255,6 @@ bot.on("message", async (msg) => {
       });
       return;
     }
-    try {
-      await deleteAccount(sessions[chatId].token, sessions[chatId].accountId);
-    } catch (e) {}
     delete sessions[chatId];
     await bot.sendMessage(chatId, "🗑 *Deleted.*", {
       parse_mode: "Markdown",
