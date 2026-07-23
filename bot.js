@@ -35,32 +35,74 @@ function escapeMarkdown(text) {
 
 function mainKeyboard() {
   return {
-    inline_keyboard: [
-      [
-        { text: "📧 New Mail", callback_data: "newmail" },
-        { text: "📥 Inbox", callback_data: "inbox" },
-      ],
-      [
-        { text: "ℹ️ My Email", callback_data: "myemail" },
-        { text: "🗑 Delete", callback_data: "delete" },
-      ],
-      [{ text: "❓ Help", callback_data: "help" }],
+    keyboard: [
+      ["📧 New Mail", "📥 Inbox"],
+      ["ℹ️ My Email", "🗑 Delete"],
+      ["❓ Help"],
     ],
+    resize_keyboard: true,
+    one_time_keyboard: false,
   };
 }
 
-async function getDomain() {
-  const res = await fetch(`${MAILTM}/domains?page=1`);
+async function getDomains() {
+  const res = await fetch(`${MAILTM}/domains`, {
+    headers: { "User-Agent": "TempMailBot/1.0" },
+  });
+  if (!res.ok) throw new Error(`Domains failed: ${res.status}`);
   const data = await res.json();
-  return data["hydra:member"][0].domain;
+  return data["hydra:member"] || [];
+}
+
+async function createAccount() {
+  const domains = await getDomains();
+  if (!domains.length) throw new Error("No domains available");
+
+  for (let i = 0; i < 8; i++) {
+    const domain = domains[Math.floor(Math.random() * domains.length)].domain;
+    const address = `\( {randomString(12)}@ \){domain}`;
+    const password = randomString(16);
+
+    const res = await fetch(`${MAILTM}/accounts`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "TempMailBot/1.0",
+      },
+      body: JSON.stringify({ address, password }),
+    });
+
+    const text = await res.text();
+    if (!text) continue;
+
+    let account;
+    try {
+      account = JSON.parse(text);
+    } catch {
+      continue;
+    }
+
+    if (account && account.id) {
+      return { address, password, account };
+    }
+
+    if (res.status === 429) {
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+  throw new Error("Could not create account after retries");
 }
 
 async function getToken(address, password) {
   const res = await fetch(`${MAILTM}/token`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent": "TempMailBot/1.0",
+    },
     body: JSON.stringify({ address, password }),
   });
+  if (!res.ok) throw new Error(`Token failed: ${res.status}`);
   return res.json();
 }
 
@@ -69,21 +111,27 @@ async function safeJson(res) {
   if (!text || text.trim() === "") return null;
   try {
     return JSON.parse(text);
-  } catch (e) {
+  } catch {
     return null;
   }
 }
 
 async function getMessages(token) {
-  const res = await fetch(`${MAILTM}/messages?page=1`, {
-    headers: { Authorization: `Bearer ${token}` },
+  const res = await fetch(`${MAILTM}/messages`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "User-Agent": "TempMailBot/1.0",
+    },
   });
   return safeJson(res);
 }
 
 async function getMessage(token, id) {
   const res = await fetch(`\( {MAILTM}/messages/ \){id}`, {
-    headers: { Authorization: `Bearer ${token}` },
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "User-Agent": "TempMailBot/1.0",
+    },
   });
   return safeJson(res);
 }
@@ -91,7 +139,10 @@ async function getMessage(token, id) {
 async function deleteAccount(token, accountId) {
   await fetch(`\( {MAILTM}/accounts/ \){accountId}`, {
     method: "DELETE",
-    headers: { Authorization: `Bearer ${token}` },
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "User-Agent": "TempMailBot/1.0",
+    },
   });
 }
 
@@ -106,13 +157,15 @@ bot.onText(/\/start/, async (msg) => {
   );
 });
 
-// Callbacks
-bot.on("callback_query", async (query) => {
-  const chatId = query.message.chat.id;
-  const data = query.data;
-  await bot.answerCallbackQuery(query.id);
+// Button handlers
+bot.on("message", async (msg) => {
+  if (!msg.text || msg.text.startsWith("/")) return;
 
-  if (data === "help") {
+  const chatId = msg.chat.id;
+  const text = msg.text.trim();
+
+  // Help
+  if (text === "❓ Help" || text === "Help") {
     await bot.sendMessage(
       chatId,
       `🤖 *Help*\n\n📧 New Mail — Generate email\n📥 Inbox — Check emails\nℹ️ My Email — Show current\n🗑 Delete — Remove session`,
@@ -121,7 +174,8 @@ bot.on("callback_query", async (query) => {
     return;
   }
 
-  if (data === "newmail") {
+  // New Mail
+  if (text === "📧 New Mail" || text === "New Mail") {
     if (sessions[chatId]) {
       await bot.sendMessage(
         chatId,
@@ -130,57 +184,44 @@ bot.on("callback_query", async (query) => {
       );
       return;
     }
-    await bot.sendMessage(chatId, "⏳ Generating...");
+
+    await bot.sendMessage(chatId, "⏳ Generating...", {
+      reply_markup: mainKeyboard(),
+    });
+
     try {
-      const domain = await getDomain();
-      let account, address, password;
-      for (let i = 0; i < 3; i++) {
-        address = `\( {randomString(12)}@ \){domain}`;
-        password = randomString(16);
-        const res = await fetch(`${MAILTM}/accounts`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ address, password }),
-        });
-        const text = await res.text();
-        if (!text) continue;
-        account = JSON.parse(text);
-        if (account.id) break;
-      }
-      if (!account?.id) {
-        await bot.sendMessage(chatId, "❌ Failed. Try again.", {
-          reply_markup: mainKeyboard(),
-        });
-        return;
-      }
+      const { address, password, account } = await createAccount();
       const tokenData = await getToken(address, password);
+
       if (!tokenData.token) {
-        await bot.sendMessage(chatId, "❌ Auth failed.", {
-          reply_markup: mainKeyboard(),
-        });
-        return;
+        throw new Error("No token received");
       }
+
       sessions[chatId] = {
         email: address,
         password,
         token: tokenData.token,
         accountId: account.id,
       };
+
       await bot.sendMessage(
         chatId,
         `✅ *Ready!*\n\n📧 \`${address}\`\n\n👆 Tap to copy`,
         { parse_mode: "Markdown", reply_markup: mainKeyboard() }
       );
     } catch (err) {
-      console.error(err);
-      await bot.sendMessage(chatId, "❌ Error. Try again.", {
-        reply_markup: mainKeyboard(),
-      });
+      console.error("NEWMAIL ERROR:", err);
+      await bot.sendMessage(
+        chatId,
+        `❌ ${err.message || "Unknown error"}\n\nTry again in a few seconds.`,
+        { reply_markup: mainKeyboard() }
+      );
     }
     return;
   }
 
-  if (data === "myemail") {
+  // My Email
+  if (text === "ℹ️ My Email" || text === "My Email") {
     if (!sessions[chatId]) {
       await bot.sendMessage(chatId, "❌ No email. Create one first.", {
         reply_markup: mainKeyboard(),
@@ -195,23 +236,31 @@ bot.on("callback_query", async (query) => {
     return;
   }
 
-  if (data === "inbox") {
+  // Inbox
+  if (text === "📥 Inbox" || text === "Inbox") {
     if (!sessions[chatId]) {
       await bot.sendMessage(chatId, "❌ No email. Create one first.", {
         reply_markup: mainKeyboard(),
       });
       return;
     }
-    await bot.sendMessage(chatId, "🔄 Checking...");
+
+    await bot.sendMessage(chatId, "🔄 Checking...", {
+      reply_markup: mainKeyboard(),
+    });
+
     try {
       const result = await getMessages(sessions[chatId].token);
-      if (!result?.["hydra:member"]) {
-        await bot.sendMessage(chatId, "⚠️ Server error.", {
+
+      if (!result || !result["hydra:member"]) {
+        await bot.sendMessage(chatId, "⚠️ Could not reach mail server.", {
           reply_markup: mainKeyboard(),
         });
         return;
       }
+
       const messages = result["hydra:member"];
+
       if (!messages.length) {
         await bot.sendMessage(
           chatId,
@@ -220,22 +269,20 @@ bot.on("callback_query", async (query) => {
         );
         return;
       }
+
       sessions[chatId].messages = messages;
-      const keyboard = messages.map((m, i) => [
-        {
-          text: `${i + 1}. ${(m.subject || "No subject").substring(0, 40)}`,
-          callback_data: `read_${i}`,
-        },
-      ]);
-      keyboard.push([{ text: "🔙 Menu", callback_data: "menu" }]);
-      await bot.sendMessage(
-        chatId,
-        `📬 *${messages.length} email(s)*\n\nTap to read:`,
-        {
-          parse_mode: "Markdown",
-          reply_markup: { inline_keyboard: keyboard },
-        }
-      );
+
+      let list = `📬 *${messages.length} email(s)*\n\n`;
+      messages.forEach((m, i) => {
+        list += `*\( {i + 1}.* From: \` \){m.from.address}\`\n`;
+        list += `    ${escapeMarkdown(m.subject || "No subject")}\n\n`;
+      });
+      list += `Reply with number (1, 2, 3...) to read.`;
+
+      await bot.sendMessage(chatId, list, {
+        parse_mode: "Markdown",
+        reply_markup: mainKeyboard(),
+      });
     } catch (err) {
       console.error(err);
       await bot.sendMessage(chatId, "❌ Inbox failed.", {
@@ -245,35 +292,41 @@ bot.on("callback_query", async (query) => {
     return;
   }
 
-  if (data.startsWith("read_")) {
-    const index = parseInt(data.split("_")[1]);
-    if (!sessions[chatId]?.messages?.[index]) {
-      await bot.sendMessage(chatId, "❌ Invalid.", {
+  // Read by number
+  if (/^\d+$/.test(text) && sessions[chatId]?.messages) {
+    const index = parseInt(text) - 1;
+    if (!sessions[chatId].messages[index]) {
+      await bot.sendMessage(chatId, "❌ Invalid number.", {
         reply_markup: mainKeyboard(),
       });
       return;
     }
+
     try {
       const full = await getMessage(
         sessions[chatId].token,
         sessions[chatId].messages[index].id
       );
+
       if (!full) {
-        await bot.sendMessage(chatId, "⚠️ Fetch failed.", {
+        await bot.sendMessage(chatId, "⚠️ Could not fetch email.", {
           reply_markup: mainKeyboard(),
         });
         return;
       }
-      let rawBody = full.text
-        ? full.text.substring(0, 4000)
-        : full.html
-        ? stripHtml(
-            Array.isArray(full.html)
-              ? full.html.map((h) => h.value || h).join(" ")
-              : full.html
-          ).substring(0, 4000)
-        : "(Empty)";
+
+      let rawBody = "(Empty)";
+      if (full.text) {
+        rawBody = full.text.substring(0, 4000);
+      } else if (full.html) {
+        const htmlStr = Array.isArray(full.html)
+          ? full.html.map((h) => (typeof h === "string" ? h : h.value || "")).join(" ")
+          : String(full.html);
+        rawBody = stripHtml(htmlStr).substring(0, 4000);
+      }
+
       const otp = detectOtp(rawBody);
+
       await bot.sendMessage(
         chatId,
         `📩 *#\( {index + 1}*\nFrom: \` \){full.from.address}\`\nSubject: ${escapeMarkdown(
@@ -281,6 +334,7 @@ bot.on("callback_query", async (query) => {
         )}` + (otp ? `\n🔐 OTP: \`${otp}\`` : ""),
         { parse_mode: "Markdown" }
       );
+
       await bot.sendMessage(chatId, rawBody, {
         disable_web_page_preview: true,
         reply_markup: mainKeyboard(),
@@ -294,7 +348,8 @@ bot.on("callback_query", async (query) => {
     return;
   }
 
-  if (data === "delete") {
+  // Delete
+  if (text === "🗑 Delete" || text === "Delete") {
     if (!sessions[chatId]) {
       await bot.sendMessage(chatId, "❌ Nothing to delete.", {
         reply_markup: mainKeyboard(),
@@ -312,19 +367,10 @@ bot.on("callback_query", async (query) => {
     return;
   }
 
-  if (data === "menu") {
-    await bot.sendMessage(chatId, "🏠 Menu", {
-      reply_markup: mainKeyboard(),
-    });
-  }
-});
-
-bot.on("message", (msg) => {
-  if (msg.text && !msg.text.startsWith("/")) {
-    bot.sendMessage(msg.chat.id, "💡 Use buttons:", {
-      reply_markup: mainKeyboard(),
-    });
-  }
+  // Fallback
+  await bot.sendMessage(chatId, "💡 Use the buttons below.", {
+    reply_markup: mainKeyboard(),
+  });
 });
 
 console.log("🤖 Temp Mail Bot running...");
