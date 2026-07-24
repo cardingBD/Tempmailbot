@@ -2,10 +2,12 @@ const TelegramBot = require("node-telegram-bot-api");
 const fetch = require("node-fetch");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
+const API = "https://api.mail.tm";
+
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const sessions = {};
 
-function randomString(len = 10) {
+function randomString(len = 12) {
   return Math.random().toString(36).substring(2, 2 + len);
 }
 
@@ -43,32 +45,86 @@ function mainKeyboard() {
   };
 }
 
-async function createEmail() {
-  const res = await fetch(
-    "https://www.1secmail.com/api/v1/?action=genRandomMailbox&count=1"
-  );
-  if (!res.ok) throw new Error(`Generate failed: ${res.status}`);
+const headers = {
+  "Content-Type": "application/json",
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+};
+
+async function getDomains() {
+  const res = await fetch(`${API}/domains`, { headers });
+  if (!res.ok) throw new Error(`Domains failed: ${res.status}`);
   const data = await res.json();
-  if (!data || !data[0]) throw new Error("No email generated");
-  const email = data[0];
-  const [login, domain] = email.split("@");
-  return { email, login, domain };
+  return data["hydra:member"] || [];
 }
 
-async function getMessages(login, domain) {
-  const res = await fetch(
-    `https://www.1secmail.com/api/v1/?action=getMessages&login=\( {login}&domain= \){domain}`
-  );
-  if (!res.ok) throw new Error(`Inbox failed: ${res.status}`);
+async function createAccount() {
+  const domains = await getDomains();
+  if (!domains.length) throw new Error("No domains available");
+
+  for (let i = 0; i < 6; i++) {
+    const domain = domains[Math.floor(Math.random() * domains.length)].domain;
+    const address = `\( {randomString(10)}@ \){domain}`;
+    const password = randomString(16);
+
+    const res = await fetch(`${API}/accounts`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ address, password }),
+    });
+
+    const text = await res.text();
+    if (!text) {
+      if (res.status === 429) await new Promise((r) => setTimeout(r, 2000));
+      continue;
+    }
+
+    let account;
+    try {
+      account = JSON.parse(text);
+    } catch {
+      continue;
+    }
+
+    if (account?.id) {
+      return { address, password, accountId: account.id };
+    }
+
+    if (res.status === 429) await new Promise((r) => setTimeout(r, 2000));
+  }
+  throw new Error("Could not create account after retries");
+}
+
+async function getToken(address, password) {
+  const res = await fetch(`${API}/token`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ address, password }),
+  });
+  if (!res.ok) throw new Error(`Token failed: ${res.status}`);
   return res.json();
 }
 
-async function readMessage(login, domain, id) {
-  const res = await fetch(
-    `https://www.1secmail.com/api/v1/?action=readMessage&login=\( {login}&domain= \){domain}&id=${id}`
-  );
+async function getMessages(token) {
+  const res = await fetch(`${API}/messages`, {
+    headers: { ...headers, Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Messages failed: ${res.status}`);
+  return res.json();
+}
+
+async function getMessage(token, id) {
+  const res = await fetch(`\( {API}/messages/ \){id}`, {
+    headers: { ...headers, Authorization: `Bearer ${token}` },
+  });
   if (!res.ok) throw new Error(`Read failed: ${res.status}`);
   return res.json();
+}
+
+async function deleteAccount(token, accountId) {
+  await fetch(`\( {API}/accounts/ \){accountId}`, {
+    method: "DELETE",
+    headers: { ...headers, Authorization: `Bearer ${token}` },
+  });
 }
 
 // /start
@@ -89,7 +145,6 @@ bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text.trim();
 
-  // Help
   if (text === "❓ Help" || text === "Help") {
     await bot.sendMessage(
       chatId,
@@ -99,7 +154,6 @@ bot.on("message", async (msg) => {
     return;
   }
 
-  // New Mail
   if (text === "📧 New Mail" || text === "New Mail") {
     if (sessions[chatId]) {
       await bot.sendMessage(
@@ -110,31 +164,35 @@ bot.on("message", async (msg) => {
       return;
     }
 
-    await bot.sendMessage(chatId, "⏳ Generating...", {
-      reply_markup: mainKeyboard(),
-    });
+    await bot.sendMessage(chatId, "⏳ Generating...", { reply_markup: mainKeyboard() });
 
     try {
-      const { email, login, domain } = await createEmail();
-      sessions[chatId] = { email, login, domain };
+      const { address, password, accountId } = await createAccount();
+      const tokenData = await getToken(address, password);
+
+      if (!tokenData.token) throw new Error("No token received");
+
+      sessions[chatId] = {
+        email: address,
+        password,
+        token: tokenData.token,
+        accountId,
+      };
 
       await bot.sendMessage(
         chatId,
-        `✅ *Ready!*\n\n📧 \`${email}\`\n\n👆 Tap to copy`,
+        `✅ *Ready!*\n\n📧 \`${address}\`\n\n👆 Tap to copy`,
         { parse_mode: "Markdown", reply_markup: mainKeyboard() }
       );
     } catch (err) {
       console.error("NEWMAIL ERROR:", err);
-      await bot.sendMessage(
-        chatId,
-        `❌ ${err.message}\n\nTry again.`,
-        { reply_markup: mainKeyboard() }
-      );
+      await bot.sendMessage(chatId, `❌ ${err.message}\n\nTry again later.`, {
+        reply_markup: mainKeyboard(),
+      });
     }
     return;
   }
 
-  // My Email
   if (text === "ℹ️ My Email" || text === "My Email") {
     if (!sessions[chatId]) {
       await bot.sendMessage(chatId, "❌ No email. Create one first.", {
@@ -150,7 +208,6 @@ bot.on("message", async (msg) => {
     return;
   }
 
-  // Inbox
   if (text === "📥 Inbox" || text === "Inbox") {
     if (!sessions[chatId]) {
       await bot.sendMessage(chatId, "❌ No email. Create one first.", {
@@ -159,17 +216,13 @@ bot.on("message", async (msg) => {
       return;
     }
 
-    await bot.sendMessage(chatId, "🔄 Checking...", {
-      reply_markup: mainKeyboard(),
-    });
+    await bot.sendMessage(chatId, "🔄 Checking...", { reply_markup: mainKeyboard() });
 
     try {
-      const messages = await getMessages(
-        sessions[chatId].login,
-        sessions[chatId].domain
-      );
+      const data = await getMessages(sessions[chatId].token);
+      const messages = data["hydra:member"] || [];
 
-      if (!messages || messages.length === 0) {
+      if (!messages.length) {
         await bot.sendMessage(
           chatId,
           `📭 *Empty*\n\n\`${sessions[chatId].email}\``,
@@ -182,7 +235,7 @@ bot.on("message", async (msg) => {
 
       let list = `📬 *${messages.length} email(s)*\n\n`;
       messages.forEach((m, i) => {
-        list += `*\( {i + 1}.* From: \` \){m.from}\`\n`;
+        list += `*\( {i + 1}.* From: \` \){m.from.address}\`\n`;
         list += `    ${escapeMarkdown(m.subject || "No subject")}\n\n`;
       });
       list += `Reply with number (1, 2, 3...) to read.`;
@@ -200,7 +253,6 @@ bot.on("message", async (msg) => {
     return;
   }
 
-  // Read by number
   if (/^\d+$/.test(text) && sessions[chatId]?.messages) {
     const index = parseInt(text) - 1;
     if (!sessions[chatId].messages[index]) {
@@ -211,16 +263,17 @@ bot.on("message", async (msg) => {
     }
 
     try {
-      const msgData = sessions[chatId].messages[index];
-      const full = await readMessage(
-        sessions[chatId].login,
-        sessions[chatId].domain,
-        msgData.id
+      const full = await getMessage(
+        sessions[chatId].token,
+        sessions[chatId].messages[index].id
       );
 
-      let rawBody = full.textBody || full.htmlBody || "(Empty)";
-      if (full.htmlBody && !full.textBody) {
-        rawBody = stripHtml(full.htmlBody);
+      let rawBody = full.text || "(Empty)";
+      if (!full.text && full.html) {
+        const html = Array.isArray(full.html)
+          ? full.html.map((h) => h.value || h).join(" ")
+          : full.html;
+        rawBody = stripHtml(html);
       }
       rawBody = rawBody.substring(0, 4000);
 
@@ -228,7 +281,7 @@ bot.on("message", async (msg) => {
 
       await bot.sendMessage(
         chatId,
-        `📩 *#\( {index + 1}*\nFrom: \` \){full.from}\`\nSubject: ${escapeMarkdown(
+        `📩 *#\( {index + 1}*\nFrom: \` \){full.from.address}\`\nSubject: ${escapeMarkdown(
           full.subject || "—"
         )}` + (otp ? `\n🔐 OTP: \`${otp}\`` : ""),
         { parse_mode: "Markdown" }
@@ -247,7 +300,6 @@ bot.on("message", async (msg) => {
     return;
   }
 
-  // Delete
   if (text === "🗑 Delete" || text === "Delete") {
     if (!sessions[chatId]) {
       await bot.sendMessage(chatId, "❌ Nothing to delete.", {
@@ -255,6 +307,9 @@ bot.on("message", async (msg) => {
       });
       return;
     }
+    try {
+      await deleteAccount(sessions[chatId].token, sessions[chatId].accountId);
+    } catch (e) {}
     delete sessions[chatId];
     await bot.sendMessage(chatId, "🗑 *Deleted.*", {
       parse_mode: "Markdown",
@@ -263,7 +318,6 @@ bot.on("message", async (msg) => {
     return;
   }
 
-  // Fallback
   await bot.sendMessage(chatId, "💡 Use the buttons below.", {
     reply_markup: mainKeyboard(),
   });
